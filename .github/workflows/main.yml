@@ -1,425 +1,216 @@
-name: Windows RDP via Tailscale (A)
-
+name: RDP
 
 
 on:
 
-  workflow_dispatch:
-
-    inputs:
-
-      ts_tailnet:
-
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
-
-        required: true
-
-      ts_api_key:
-
-        description: "Tailscale API key (device admin, no 'Bearer')"
-
-        required: true
-
-      ts_authkey:
-
-        description: "Tailscale auth key (reusable or ephemeral)"
-
-        required: true
-
-      gh_api_token:
-
-        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
-
-        required: true
-
-      test_mode:
-
-        description: "Run 5-minute test loop"
-
-        type: boolean
-
-        default: false
-
-      runtime_minutes:
-
-        description: "Runtime in minutes (max 360; capped to 355)"
-
-        required: false
-
-        default: "355"
-
-      loops:
-
-        description: "How many handoffs (0 = infinite)"
-
-        required: false
-
-        default: "0"
-
-
-
-concurrency:
-
-  group: tailscale-rdp-singleton
-
-  cancel-in-progress: false
-
-
-
-permissions:
-
-  contents: read
-
-  actions: write
-
-
-
-defaults:
-
-  run:
-
-    shell: pwsh
-
-
-
-env:
-
-  RDP_USER: Bullettemporary
-
-  RDP_PASS: Bullet@12345
-
-  TS_HOSTNAME: bullet
-
+  workflow_dispatch:
 
 
 jobs:
 
-  rdp:
+  secure-rdp:
 
-    runs-on: windows-2022
+    runs-on: windows-latest
 
-    timeout-minutes: 370
+    timeout-minutes: 3600
 
-    steps:
 
-      - name: 🔧 Resolve inputs (safe)
+    steps:
 
-        id: cfg
+      - name: Configure Core RDP Settings
 
-        env:
+        run: |
 
-          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
 
-          RAW_APIKEY:   ${{ inputs.ts_api_key }}
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
 
-          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+                             -Name "fDenyTSConnections" -Value 0 -Force
 
-          RAW_PAT:      ${{ inputs.gh_api_token }}
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
 
-          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
+                             -Name "UserAuthentication" -Value 0 -Force
 
-          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
 
-          RAW_LOOPS:    ${{ inputs.loops || '0' }}
+                             -Name "SecurityLayer" -Value 0 -Force
 
-        run: |
 
-          function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
+          # Remove any existing rule with the same name to avoid duplication
 
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
+         
 
-          $tailnet = $env:RAW_TAILNET
+          # For testing, allow any incoming connection on port 3389
 
-          $apiKey  = $env:RAW_APIKEY
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
 
-          $authKey = $env:RAW_AUTHKEY
+            dir=in action=allow protocol=TCP localport=3389
 
-          $pat     = $env:RAW_PAT
 
-          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
 
-            Write-Error "Missing required inputs"; exit 1
+          Restart-Service -Name TermService -Force
 
-          }
 
+      - name: Create RDP User with Secure Password
 
+        run: |
 
-          # Robust boolean
+          Add-Type -AssemblyName System.Security
 
-          $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
+          $charSet = @{
 
+              Upper   = [char[]](65..90)      # A-Z
 
+              Lower   = [char[]](97..122)     # a-z
 
-          $runtime = ToIntOr $env:RAW_RUNTIME 355
+              Number  = [char[]](48..57)      # 0-9
 
-          if ($isTest) { $runtime = 5 }
+              Special = ([char[]](33..47) + [char[]](58..64) +
 
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
 
+          }
 
-          # Ensure ~6h (355) when test_mode is off and value is too small
+          $rawPassword = @()
 
-          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
 
-          if ($runtime -gt 360) { $runtime = 355 }
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
 
+          $rawPassword += $charSet.Number | Get-Random -Count 4
 
+          $rawPassword += $charSet.Special | Get-Random -Count 4
 
-          $loops = ToIntOr $env:RAW_LOOPS 0
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
 
-          if ($loops -lt 0) { $loops = 0 }
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
 
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
 
-          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
+         
 
-          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
 
-          "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
+         
 
-          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          if (-not (Get-LocalUser -Name "RDP")) {
 
-          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+              Write-Error "User creation failed"
 
-          Write-Host "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
+              exit 1
 
+          }
 
 
-      - name: ⚙️ Install Tailscale (if missing) & show version
+      - name: Install Tailscale
 
-        run: |
+        run: |
 
-          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
 
-          if (-not (Test-Path $exe)) {
+          $installerPath = "$env:TEMP\tailscale.msi"
 
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+         
 
-            $dst = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
 
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
 
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          Remove-Item $installerPath -Force
 
-          }
 
-          Start-Service Tailscale -ErrorAction SilentlyContinue
+      - name: Establish Tailscale Connection
 
-          & "C:\Program Files\Tailscale\tailscale.exe" version
+        run: |
 
+          # Bring up Tailscale with the provided auth key and set a unique hostname
 
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-      - name: 🔐 Enable RDP user + firewall
+         
 
-        run: |
+          # Wait for Tailscale to assign an IP
 
-          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $tsIP = $null
 
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          $retries = 0
 
-          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+          while (-not $tsIP -and $retries -lt 10) {
 
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
 
-            Add-LocalGroupMember -Group Administrators -Member $u
+              Start-Sleep -Seconds 5
 
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+              $retries++
 
-          } else {
+          }
 
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+         
 
-            Enable-LocalUser -Name $u
+          if (-not $tsIP) {
 
-          }
+              Write-Error "Tailscale IP not assigned. Exiting."
 
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+              exit 1
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          }
 
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+     
 
-      - name: 🧹 PURGE any devices containing 'bullet' (startup)
+      - name: Verify RDP Accessibility
 
-        run: |
+        run: |
 
-          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+         
 
-          $match = { param($d)
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
 
-            ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet')
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
 
-          }
+          if (-not $testResult.TcpTestSucceeded) {
 
-          try {
+              Write-Error "TCP connection to RDP port 3389 failed"
 
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+              exit 1
 
-            foreach ($d in $resp.devices) {
+          }
 
-              if (& $match $d) {
+          Write-Host "TCP connectivity successful!"
 
-                try {
 
-                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+      - name: Maintain Connection
 
-                  Write-Host "Deleted at start: $($d.name)"
+        run: |
 
-                } catch {}
+          Write-Host "`n=== RDP ACCESS ==="
 
-              }
+          Write-Host "Address: $env:TAILSCALE_IP"
 
-            }
+          Write-Host "Username: RDP"
 
-          } catch { Write-Warning "Startup purge failed: $_" }
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
 
+          Write-Host "==================`n"
 
+         
 
-      - name: 🔗 Tailscale up (hostname=bullet) + show IP/FQDN/DERP
+          # Keep runner active indefinitely (or until manually cancelled)
 
-        id: up
+          while ($true) {
 
-        run: |
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
 
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+              Start-Sleep -Seconds 300
 
-          & $ts logout | Out-Null
-
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
-
-          Start-Sleep -Seconds 2
-
-
-
-          $ip4 = (& $ts ip -4 | Select-Object -First 1)
-
-          $status = & $ts status --json | ConvertFrom-Json
-
-          $fqdn = $status.Self.DNSName
-
-          $derp = $status.Self.DERP
-
-          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
-
-          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
-
-          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
-
-
-
-          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-
-
-      - name: ⏳ Keep alive
-
-        run: |
-
-          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
-
-          $end=(Get-Date).AddMinutes($mins)
-
-          while((Get-Date) -lt $end){
-
-            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
-
-            Write-Host "RDP alive... ($left min left)"
-
-            Start-Sleep -Seconds 60
-
-          }
-
-
-
-      - name: 🧹 PURGE any devices containing 'bullet' (exit)
-
-        if: always()
-
-        run: |
-
-          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
-
-          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
-
-          $match = { param($d)
-
-            ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet')
-
-          }
-
-          try {
-
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
-
-            foreach ($d in $resp.devices) {
-
-              if (& $match $d) {
-
-                try {
-
-                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
-
-                  Write-Host "Deleted at exit: $($d.name)"
-
-                } catch {}
-
-              }
-
-            }
-
-          } catch { Write-Warning "Exit purge failed: $_" }
-
-
-
-      - name: 🔁 Dispatch workflow B (instant, forever by default)
-
-        if: always()
-
-        run: |
-
-          $loops=[int]"${{ steps.cfg.outputs.loops }}"
-
-          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
-
-          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
-
-
-
-          $token="${{ steps.cfg.outputs.pat }}"
-
-          $body=@{
-
-            ref    = "${{ github.ref_name }}"
-
-            inputs = @{
-
-              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
-
-              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
-
-              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
-
-              gh_api_token    = "$token"
-
-              test_mode       = "false"
-
-              runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
-
-              loops           = "$next"
-
-            }
-
-          } | ConvertTo-Json -Depth 5
-
-
-
-          Invoke-RestMethod -Method POST `
-
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
-
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-
-            -Body $body
+          }
