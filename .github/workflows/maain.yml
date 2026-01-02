@@ -1,0 +1,60 @@
+name: RDP-SelfHosted-Permanent
+
+on:
+  workflow_dispatch: # يتم تشغيله يدوياً مرة واحدة فقط من تبويب Actions
+
+jobs:
+  rdp-session:
+    runs-on: self-hosted # يعمل على السيرفر الخاص بك
+    
+    steps:
+      - name: Configure RDP and Firewall
+        run: |
+          # تفعيل Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          
+          # فتح المنفذ 3389 في جدار الحماية
+          if (!(Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
+          }
+          Write-Host "RDP and Firewall are configured."
+
+      - name: Setup Permanent User
+        run: |
+          # إنشاء مستخدم ثابت بكلمة مرور من اختيارك
+          $username = "RDP_User"
+          $password = "YourSecurePassword123!" # يمكنك تغيير كلمة المرور هنا
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $username -Password $securePass
+              Write-Host "User password updated."
+          } else {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+              Write-Host "New user created and added to Administrators."
+          }
+
+      - name: Connect Tailscale
+        run: |
+          # مسار برنامج Tailscale الافتراضي
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          
+          # الاتصال باستخدام المفتاح الجديد الخاص بك
+          & $tsExe up --authkey=tskey-auth-kcLZAknq6B21CNTRL-zdpjHrN7MQiYQHCqAouDRiBSfNggemEg --hostname=my-custom-server --reconnect
+          
+          # جلب وعرض عنوان IP الخاص بـ Tailscale
+          $tsIP = & $tsExe ip -4
+          Write-Host "------------------------------------"
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Username    : RDP_User"
+          Write-Host "------------------------------------"
+
+      - name: Infinite Run (Keep Alive)
+        run: |
+          Write-Host "Workflow is now in infinite loop. RDP is active."
+          # حلقة لا نهائية لإبقاء المهمة تعمل للأبد
+          while ($true) {
+              Start-Sleep -Seconds 3600
+          }
